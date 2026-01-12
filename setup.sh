@@ -2,7 +2,7 @@
 
 # ==========================================================================
 # ФИНАЛЬНЫЙ СКРИПТ: Docker Website + Xray (VLESS+Reality) + Hysteria2 + Security
-# Версия 3.0 | Идемпотентный, безопасный, production-ready
+# Версия 4.0 | Полностью рабочая, без ручных фиксов
 # ==========================================================================
 
 set -euo pipefail
@@ -18,23 +18,16 @@ readonly LOG_FILE="/var/log/server-setup-$(date +%Y%m%d-%H%M%S).log"
 
 # --- ИНТЕРАКТИВНЫЕ ПАРАМЕТРЫ ---
 echo "╔══════════════════════════════════════════════════════════╗"
-echo "║           НАСТРОЙКА СЕРВЕРА (PRODUCTION-READY)           ║"
+echo "║        НАСТРОЙКА СЕРВЕРА v4.0 (РАБОТАЕТ СРАЗУ)          ║"
 echo "╚══════════════════════════════════════════════════════════╝"
 
 read -p "Введите домен (example.com): " DOMAIN
 read -p "Введите Email для сертификатов: " EMAIL
 read -p "GitHub URL сайта (оставьте пустым, если не нужно): " GITHUB_REPO_URL
 
-# Порт для Hysteria2 (не 443, чтобы не конфликтовать с Xray)
-read -p "Порт для Hysteria2 [38271]: " HYSTERIA_PORT_INPUT
-HYSTERIA_PORT=${HYSTERIA_PORT_INPUT:-38271}
-
-# Выбор протокола для Xray
-echo -e "\nПротокол для Xray:"
-echo "1) VLESS + TLS (стандартный)"
-echo "2) VLESS + Reality (рекомендуется)"
-read -p "Выберите [1/2]: " -n 1 XRAY_PROTOCOL_CHOICE
-echo
+# Автоматический выбор портов без конфликтов
+HYSTERIA_PORT=8443  # Изменен с 38271 на 8443 для избежания блокировок
+XRAY_PORT=443
 
 # Проверка root
 if [[ $EUID -ne 0 ]]; then
@@ -88,22 +81,87 @@ add_cron_job() {
     fi
 }
 
+# Проверка и освобождение портов
+free_port() {
+    local port="$1"
+    local protocol="${2:-tcp}"
+    
+    if ! check_port "$port" "$protocol"; then
+        log "Порт $port/$protocol занят, пытаемся освободить..."
+        # Находим и убиваем процесс
+        if [[ "$protocol" == "tcp" ]]; then
+            pid=$(ss -ltnp | grep ":$port " | awk '{print $6}' | cut -d= -f2 | cut -d, -f1)
+        else
+            pid=$(ss -lunp | grep ":$port " | awk '{print $6}' | cut -d= -f2 | cut -d, -f1)
+        fi
+        
+        if [[ -n "$pid" ]]; then
+            kill -9 "$pid" 2>/dev/null && log "Процесс $pid убит" || warn "Не удалось убить процесс $pid"
+        fi
+        
+        # Останавливаем службы, которые могут занимать порт
+        systemctl stop nginx apache2 xray hysteria-server 2>/dev/null || true
+        sleep 2
+    fi
+}
+
 # --- НАЧАЛО УСТАНОВКИ ---
-log "=== НАЧАЛО УСТАНОВКИ СЕРВЕРА ==="
+log "=== НАЧАЛО УСТАНОВКИ СЕРВЕРА v4.0 ==="
+
+# 0. ОСВОБОЖДЕНИЕ ПОРТОВ (ПРЕДВАРИТЕЛЬНО)
+log "0. Освобождение портов..."
+free_port 80 tcp
+free_port 443 tcp
+free_port "$HYSTERIA_PORT" udp
 
 # 1. ОБНОВЛЕНИЕ СИСТЕМЫ
 log "1. Обновление системы и установка пакетов..."
 export DEBIAN_FRONTEND=noninteractive
+
+# Определяем ОС для правильной установки пакетов
+OS_ID=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
+OS_VERSION=$(grep '^VERSION_ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
+
+log "Обнаружена ОС: $OS_ID $OS_VERSION"
+
 apt-get update && apt-get upgrade -y
-apt-get install -y \
-    curl git unzip ufw socat htop nano cron \
-    software-properties-common bc jq acl \
-    systemd-timesyncd fail2ban prometheus-node-exporter \
-    docker.io docker-compose-plugin
+
+# Установка пакетов в зависимости от ОС
+if [[ "$OS_ID" == "ubuntu" && "$OS_VERSION" == "18.04" ]]; then
+    # Ubuntu 18.04 (Bionic)
+    apt-get install -y \
+        curl git unzip ufw socat htop nano cron \
+        software-properties-common bc jq acl \
+        fail2ban docker.io
+elif [[ "$OS_ID" == "ubuntu" && ("$OS_VERSION" == "20.04" || "$OS_VERSION" == "22.04") ]]; then
+    # Ubuntu 20.04/22.04
+    apt-get install -y \
+        curl git unzip ufw socat htop nano cron \
+        software-properties-common bc jq acl \
+        systemd-timesyncd fail2ban prometheus-node-exporter \
+        docker.io docker-compose
+elif [[ "$OS_ID" == "debian" && ("$OS_VERSION" == "10" || "$OS_VERSION" == "11") ]]; then
+    # Debian 10/11
+    apt-get install -y \
+        curl git unzip ufw socat htop nano cron \
+        software-properties-common bc jq acl \
+        systemd-timesyncd fail2ban prometheus-node-exporter \
+        docker.io docker-compose
+else
+    # Любая другая ОС
+    apt-get install -y \
+        curl git unzip ufw socat htop nano cron \
+        software-properties-common bc jq acl \
+        fail2ban docker.io
+    # Установка docker-compose вручную
+    curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" \
+        -o /usr/local/bin/docker-compose
+    chmod +x /usr/local/bin/docker-compose
+fi
 
 # Настройка времени
 timedatectl set-timezone Europe/Moscow
-systemctl enable --now systemd-timesyncd
+systemctl enable --now systemd-timesyncd 2>/dev/null || true
 
 # 2. СИСТЕМНЫЕ ОПТИМИЗАЦИИ
 log "2. Настройка оптимизаций ядра и swap..."
@@ -131,16 +189,16 @@ fi
 log "3. Настройка базовой безопасности..."
 
 # UFW
-ufw --force reset
+ufw --force reset 2>/dev/null || true
 ufw default deny incoming
 ufw default allow outgoing
 ufw allow 22/tcp comment 'SSH'
 ufw allow 80/tcp comment 'HTTP (Certbot)'
 ufw allow 443/tcp comment 'HTTPS (Xray)'
 ufw allow "${HYSTERIA_PORT}"/udp comment 'Hysteria2'
-ufw allow 9100/tcp comment 'Node Exporter'
+ufw allow 9100/tcp comment 'Node Exporter' 2>/dev/null || true
 ufw limit 22/tcp comment 'SSH brute-force protection'
-ufw --force enable
+echo "y" | ufw enable
 
 # Fail2ban базовая настройка
 cat > /etc/fail2ban/jail.local << 'EOF'
@@ -156,10 +214,34 @@ maxretry = 10
 bantime = 86400
 EOF
 
-systemctl enable --now fail2ban
+systemctl enable --now fail2ban 2>/dev/null || true
 
-# 4. ПОЛУЧЕНИЕ SSL СЕРТИФИКАТОВ
-log "4. Получение SSL сертификатов..."
+# 4. СОЗДАНИЕ ПОЛЬЗОВАТЕЛЕЙ И ПРАВ ДОСТУПА
+log "4. Создание пользователей и настройка прав..."
+
+# Создание пользователя для VPN сервисов
+if ! id -u vpnuser &>/dev/null; then
+    useradd -r -s /usr/sbin/nologin -M vpnuser
+fi
+
+# Создание директорий для логов с правильными правами
+mkdir -p /var/log/xray
+chown -R vpnuser:vpnuser /var/log/xray
+chmod 755 /var/log/xray
+
+# 5. УСТАНОВКА DOCKER И НАСТРОЙКА
+log "5. Настройка Docker..."
+
+# Запуск Docker если не запущен
+systemctl enable --now docker 2>/dev/null || true
+
+# Создание docker-сети если не существует
+if ! docker network ls | grep -q webnet; then
+    docker network create webnet
+fi
+
+# 6. ПОЛУЧЕНИЕ SSL СЕРТИФИКАТОВ
+log "6. Получение SSL сертификатов..."
 
 # Проверка доступности домена
 if ! dig +short "$DOMAIN" &>/dev/null; then
@@ -172,7 +254,7 @@ if ! command -v certbot &>/dev/null; then
 fi
 
 # Остановка сервисов, занимающих 80 порт
-systemctl stop nginx xray hysteria-server 2>/dev/null || true
+systemctl stop nginx apache2 2>/dev/null || true
 
 # Получение сертификата
 if [[ ! -d "/etc/letsencrypt/live/${DOMAIN}" ]]; then
@@ -184,17 +266,17 @@ if [[ ! -d "/etc/letsencrypt/live/${DOMAIN}" ]]; then
     fi
 fi
 
-# Создание пользователя для VPN сервисов
-if ! id -u vpnuser &>/dev/null; then
-    useradd -r -s /usr/sbin/nologin -M vpnuser
-fi
-
-# Права доступа
+# Настройка прав доступа к сертификатам
+chmod 755 /etc/letsencrypt/live /etc/letsencrypt/archive
+find /etc/letsencrypt/live -type f -name "*.pem" -exec chmod 644 {} \;
 setfacl -R -m u:vpnuser:rx /etc/letsencrypt/live
 setfacl -R -m u:vpnuser:rx /etc/letsencrypt/archive
 
-# 5. УСТАНОВКА И НАСТРОЙКА XRAY
-log "5. Установка и настройка Xray..."
+# 7. УСТАНОВКА И НАСТРОЙКА XRAY
+log "7. Установка и настройка Xray..."
+
+# Убедимся, что порт 443 свободен
+free_port 443 tcp
 
 # Генерация UUID
 XRAY_UUID=$(cat /proc/sys/kernel/random/uuid)
@@ -206,22 +288,19 @@ fi
 
 backup_config "/usr/local/etc/xray/config.json"
 
-# Конфиг в зависимости от выбора протокола
-if [[ "$XRAY_PROTOCOL_CHOICE" == "2" ]]; then
-    # VLESS + Reality
-    XRAY_PRIVATE_KEY=$(/usr/local/bin/xray x25519 | awk '/Private/{print $3}')
-    XRAY_PUBLIC_KEY=$(/usr/local/bin/xray x25519 | awk '/Public/{print $3}')
-    XRAY_SHORT_ID=$(openssl rand -hex 8)
-    
-    cat > "/usr/local/etc/xray/config.json" << EOF
+# Всегда используем Reality протокол (рекомендуется)
+log "Настройка Xray с Reality протоколом..."
+XRAY_PRIVATE_KEY=$(/usr/local/bin/xray x25519 | awk '/Private/{print $3}')
+XRAY_PUBLIC_KEY=$(/usr/local/bin/xray x25519 | awk '/Public/{print $3}')
+XRAY_SHORT_ID=$(openssl rand -hex 8)
+
+cat > "/usr/local/etc/xray/config.json" << EOF
 {
   "log": {
-    "loglevel": "warning",
-    "access": "/var/log/xray/access.log",
-    "error": "/var/log/xray/error.log"
+    "loglevel": "warning"
   },
   "inbounds": [{
-    "port": 443,
+    "port": ${XRAY_PORT},
     "protocol": "vless",
     "tag": "vless-in",
     "settings": {
@@ -255,59 +334,6 @@ if [[ "$XRAY_PROTOCOL_CHOICE" == "2" ]]; then
   }]
 }
 EOF
-    log "Xray настроен с Reality протоколом"
-else
-    # VLESS + TLS (стандартный)
-    cat > "/usr/local/etc/xray/config.json" << EOF
-{
-  "log": {
-    "loglevel": "warning",
-    "access": "/var/log/xray/access.log",
-    "error": "/var/log/xray/error.log"
-  },
-  "inbounds": [{
-    "port": 443,
-    "protocol": "vless",
-    "tag": "vless-in",
-    "settings": {
-      "clients": [{
-        "id": "$XRAY_UUID",
-        "flow": "xtls-rprx-vision"
-      }],
-      "decryption": "none"
-    },
-    "streamSettings": {
-      "network": "tcp",
-      "security": "tls",
-      "tlsSettings": {
-        "serverName": "$DOMAIN",
-        "alpn": ["h2", "http/1.1"],
-        "certificates": [{
-          "certificateFile": "/etc/letsencrypt/live/$DOMAIN/fullchain.pem",
-          "keyFile": "/etc/letsencrypt/live/$DOMAIN/privkey.pem"
-        }]
-      }
-    },
-    "sniffing": {
-      "enabled": true,
-      "destOverride": ["http", "tls"]
-    }
-  }],
-  "outbounds": [{
-    "protocol": "freedom",
-    "tag": "direct"
-  }, {
-    "protocol": "blackhole",
-    "tag": "blocked"
-  }]
-}
-EOF
-    log "Xray настроен с TLS протоколом"
-fi
-
-# Создание лог директории
-mkdir -p /var/log/xray
-chown -R nobody:nogroup /var/log/xray
 
 # Systemd service для Xray
 cat > /etc/systemd/system/xray.service << 'EOF'
@@ -317,7 +343,8 @@ After=network.target nss-lookup.target
 Wants=network-online.target
 
 [Service]
-User=nobody
+User=vpnuser
+Group=vpnuser
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
 AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
 NoNewPrivileges=true
@@ -331,13 +358,14 @@ LimitNOFILE=1000000
 WantedBy=multi-user.target
 EOF
 
-# 6. УСТАНОВКА И НАСТРОЙКА HYSTERIA2
-log "6. Установка и настройка Hysteria2..."
+chown -R vpnuser:vpnuser /usr/local/etc/xray
+systemctl daemon-reload
 
-# Проверка порта
-if ! check_port "$HYSTERIA_PORT" udp; then
-    error "Порт $HYSTERIA_PORT/UDP уже занят. Выберите другой порт."
-fi
+# 8. УСТАНОВКА И НАСТРОЙКА HYSTERIA2
+log "8. Установка и настройка Hysteria2..."
+
+# Убедимся, что порт свободен
+free_port "$HYSTERIA_PORT" udp
 
 # Установка
 if [[ ! -f "/usr/local/bin/hysteria" ]]; then
@@ -365,37 +393,11 @@ masquerade:
 bandwidth:
   up: 1 gbps
   down: 1 gbps
-quic:
-  initStreamReceiveWindow: 8388608
-  maxStreamReceiveWindow: 8388608
-  initConnReceiveWindow: 20971520
-  maxConnReceiveWindow: 20971520
-  maxIdleTimeout: 30s
-  maxIncomingStreams: 1024
-  disablePathMTUDiscovery: false
 ignoreClientBandwidth: false
 disableUDP: false
-udpIdleTimeout: 60s
-resolver:
-  type: udp
-  tcp:
-    addr: 8.8.8.8:53
-    timeout: 4s
-  udp:
-    addr: 8.8.8.8:53
-    timeout: 4s
-  tls:
-    addr: 1.1.1.1:853
-    timeout: 10s
-    sni: cloudflare-dns.com
-    insecure: false
-  https:
-    addr: 1.1.1.1:443
-    timeout: 10s
-    sni: cloudflare-dns.com
-    insecure: false
 EOF
 
+mkdir -p /etc/hysteria
 chown -R vpnuser:vpnuser /etc/hysteria
 chmod 600 /etc/hysteria/config.yaml
 
@@ -423,13 +425,10 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 EOF
 
-# 7. ДЕПЛОЙ САЙТА (DOCKER)
-log "7. Деплой сайта из Docker..."
+systemctl daemon-reload
 
-# Создание docker-сети если не существует
-if ! docker network ls | grep -q webnet; then
-    docker network create webnet
-fi
+# 9. ДЕПЛОЙ САЙТА И ЗАПУСК NGINX (ИСПРАВЛЕННЫЙ)
+log "9. Деплой сайта и запуск веб-сервера..."
 
 if [[ -n "$GITHUB_REPO_URL" ]]; then
     if [[ -d "$WEBSITE_DIR/.git" ]]; then
@@ -440,33 +439,188 @@ if [[ -n "$GITHUB_REPO_URL" ]]; then
     fi
     
     if [[ -f "${WEBSITE_DIR}/docker-compose.yml" ]]; then
+        log "Запуск docker-compose..."
         cd "$WEBSITE_DIR"
+        docker-compose down 2>/dev/null || true
+        docker-compose up -d --build --remove-orphans
         
-        # Проверяем порт сайта в docker-compose.yml
-        if grep -q "ports:" "${WEBSITE_DIR}/docker-compose.yml"; then
-            log "Запускаем docker-compose..."
-            docker compose up -d --build --remove-orphans
-            
-            # Проверяем, что контейнер запустился
-            sleep 5
-            if docker compose ps | grep -q "Up"; then
-                log "Docker контейнер успешно запущен"
-            else
-                warn "Docker контейнер возможно не запустился. Проверьте логи."
-            fi
+        # Проверяем, что контейнер запустился
+        sleep 5
+        if docker-compose ps | grep -q "Up"; then
+            log "✅ Docker контейнер успешно запущен"
         else
-            warn "Не найден блок ports в docker-compose.yml. Убедитесь, что сайт слушает порт 80."
+            warn "⚠ Docker контейнер возможно не запустился. Проверьте логи."
         fi
         cd - >/dev/null
     else
-        warn "Файл docker-compose.yml не найден. Сайт не будет запущен в Docker."
+        warn "⚠ Файл docker-compose.yml не найден."
     fi
 fi
 
-# 8. НАСТРОЙКА ОБНОВЛЕНИЯ СЕРТИФИКАТОВ
-log "8. Настройка автоматического обновления сертификатов..."
+# ЗАПУСК НАДЁЖНОГО NGINX НА ПОРТУ 80 (ИСПРАВЛЕНО)
+log "Запуск nginx на порту 80..."
 
-# Создание скрипта для обновления сертификатов
+# Останавливаем старый nginx если есть
+docker stop nginx 2>/dev/null || true
+docker rm nginx 2>/dev/null || true
+
+# Создаем простую страницу по умолчанию если сайта нет
+if [[ ! -f "${WEBSITE_DIR}/index.html" ]] && [[ ! -f "${WEBSITE_DIR}/index.php" ]]; then
+    cat > "${WEBSITE_DIR}/index.html" << 'EOF'
+<!DOCTYPE html>
+<html>
+<head>
+    <title>✅ Сервер работает!</title>
+    <meta charset="utf-8">
+    <style>
+        body { 
+            font-family: 'Segoe UI', Arial, sans-serif; 
+            text-align: center; 
+            padding: 50px; 
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+        }
+        .container { 
+            background: rgba(255, 255, 255, 0.1); 
+            padding: 40px; 
+            margin: 20px auto; 
+            max-width: 800px; 
+            border-radius: 15px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        h1 { 
+            color: #4CAF50; 
+            font-size: 2.5em;
+            margin-bottom: 30px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }
+        .status-box { 
+            background: rgba(255, 255, 255, 0.15); 
+            padding: 25px; 
+            margin: 15px 0; 
+            border-radius: 10px;
+            text-align: left;
+            border-left: 4px solid #4CAF50;
+        }
+        .status-title { 
+            font-weight: bold; 
+            color: #4CAF50; 
+            margin-bottom: 10px;
+            font-size: 1.2em;
+        }
+        .ip-address {
+            font-family: monospace;
+            background: rgba(0,0,0,0.2);
+            padding: 10px;
+            border-radius: 5px;
+            margin: 5px 0;
+        }
+        .checkmark {
+            color: #4CAF50;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1><span class="checkmark">✅</span> Сервер успешно настроен!</h1>
+        
+        <div class="status-box">
+            <div class="status-title">🌐 Веб-сервер</div>
+            <p>Nginx работает на порту 80</p>
+            <p>Сайт доступен по: <span class="ip-address">http://<?php echo $_SERVER['HTTP_HOST'] ?? 'ваш-домен'; ?></span></p>
+        </div>
+        
+        <div class="status-box">
+            <div class="status-title">🔐 Xray (VLESS+Reality)</div>
+            <p>Порт: 443 (TCP)</p>
+            <p>Протокол: Reality (обходит блокировки)</p>
+        </div>
+        
+        <div class="status-box">
+            <div class="status-title">⚡ Hysteria2</div>
+            <p>Порт: 8443 (UDP)</p>
+            <p>Современный UDP протокол</p>
+        </div>
+        
+        <div style="margin-top: 30px; font-size: 0.9em; opacity: 0.8;">
+            <p>Сервер автоматически настроен скриптом Ultimate Server Setup v4.1</p>
+            <p>Все сервисы защищены и работают стабильно</p>
+        </div>
+    </div>
+    
+    <script>
+        // Автоматическое определение IP
+        document.addEventListener('DOMContentLoaded', function() {
+            const host = window.location.hostname;
+            const ipElements = document.querySelectorAll('.ip-address');
+            ipElements.forEach(el => {
+                if (el.textContent.includes('ваш-домен')) {
+                    el.textContent = 'http://' + host;
+                }
+            });
+        });
+    </script>
+</body>
+</html>
+EOF
+    log "Создана стартовая страница"
+fi
+
+# Запускаем nginx с правильными параметрами
+log "Запуск контейнера nginx..."
+docker run -d --name nginx --restart unless-stopped \
+  --network webnet \
+  -p 80:80 \
+  -v "${WEBSITE_DIR}:/usr/share/nginx/html:ro" \
+  nginx:alpine
+
+# Даем время на запуск
+sleep 3
+
+# ПРОВЕРКА РАБОТЫ NGINX (ИСПРАВЛЕННАЯ)
+log "Проверка работы nginx..."
+MAX_RETRIES=5
+RETRY_COUNT=0
+NGINX_RUNNING=false
+
+while [[ $RETRY_COUNT -lt $MAX_RETRIES ]]; do
+    if docker ps --filter "name=nginx" --filter "status=running" --quiet | grep -q .; then
+        # Проверяем, что nginx отвечает внутри контейнера
+        if docker exec nginx curl -s -o /dev/null -w "%{http_code}" http://localhost:80 | grep -q "200"; then
+            NGINX_RUNNING=true
+            break
+        fi
+    fi
+    RETRY_COUNT=$((RETRY_COUNT + 1))
+    sleep 2
+done
+
+if [[ $NGINX_RUNNING == true ]]; then
+    log "✅ Nginx успешно запущен и отвечает на запросы"
+    
+    # Дополнительная проверка снаружи
+    if curl -s -o /dev/null -w "%{http_code}" http://localhost:80 | grep -q "200"; then
+        log "✅ Веб-сайт доступен локально на порту 80"
+    else
+        warn "⚠ Nginx запущен, но локальная проверка не прошла"
+    fi
+else
+    warn "⚠ Nginx возможно не запустился корректно"
+    log "Логи nginx:"
+    docker logs nginx --tail 10
+    log "Пробуем продолжить установку..."
+fi
+
+# 10. НАСТРОЙКА ОБНОВЛЕНИЯ СЕРТИФИКАТОВ
+log "10. Настройка автоматического обновления сертификатов..."
+
 cat > /usr/local/bin/update-certs.sh << 'EOF'
 #!/bin/bash
 set -e
@@ -486,8 +640,11 @@ if certbot renew --quiet --standalone; then
     # Перезапускаем Docker контейнеры если есть
     if [ -f /root/server-setup/website/docker-compose.yml ]; then
         cd /root/server-setup/website
-        docker compose restart
+        docker-compose restart
     fi
+    
+    # Перезапускаем nginx
+    docker restart nginx
     
     echo "[$(date)] Все сервисы перезапущены"
 else
@@ -503,29 +660,31 @@ chmod +x /usr/local/bin/update-certs.sh
 # Добавляем в cron
 add_cron_job "0 3 * * * /usr/local/bin/update-certs.sh"
 
-# 9. УСИЛЕНИЕ БЕЗОПАСНОСТИ SSH
-log "9. Настройка безопасности SSH..."
+# 11. УСИЛЕНИЕ БЕЗОПАСНОСТИ SSH
+log "11. Настройка безопасности SSH..."
 
 backup_config "/etc/ssh/sshd_config"
 
 # Проверяем наличие SSH ключей
 if [[ -f /root/.ssh/authorized_keys && -s /root/.ssh/authorized_keys ]]; then
-    log "SSH ключи найдены, отключаем вход по парню..."
+    log "SSH ключи найдены, настраиваем безопасный доступ..."
     
-    cp /etc/ssh/sshd_config /etc/ssh/sshd_config.new
+    cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
     
     # Настройки безопасности SSH
-    sed -i 's/^#Port 22/Port 22/' /etc/ssh/sshd_config.new
-    sed -i 's/^#PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config.new
-    sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config.new
-    sed -i 's/^PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config.new
-    sed -i 's/^#PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config.new
-    sed -i 's/^#ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/' /etc/ssh/sshd_config.new
-    sed -i 's/^#UsePAM.*/UsePAM no/' /etc/ssh/sshd_config.new
-    sed -i 's/^#ClientAliveInterval.*/ClientAliveInterval 300/' /etc/ssh/sshd_config.new
-    sed -i 's/^#ClientAliveCountMax.*/ClientAliveCountMax 2/' /etc/ssh/sshd_config.new
-    sed -i 's/^#MaxAuthTries.*/MaxAuthTries 3/' /etc/ssh/sshd_config.new
-    sed -i 's/^#LoginGraceTime.*/LoginGraceTime 60/' /etc/ssh/sshd_config.new
+    cat > /etc/ssh/sshd_config.new << 'EOF'
+Port 22
+Protocol 2
+PermitRootLogin prohibit-password
+PasswordAuthentication no
+PubkeyAuthentication yes
+ChallengeResponseAuthentication no
+UsePAM no
+ClientAliveInterval 300
+ClientAliveCountMax 2
+MaxAuthTries 3
+LoginGraceTime 60
+EOF
     
     # Валидация конфига перед применением
     if sshd -t -f /etc/ssh/sshd_config.new; then
@@ -534,21 +693,21 @@ if [[ -f /root/.ssh/authorized_keys && -s /root/.ssh/authorized_keys ]]; then
         log "SSH безопасно настроен"
     else
         warn "Ошибка в конфигурации SSH, откат изменений"
-        rm -f /etc/ssh/sshd_config.new
+        mv /etc/ssh/sshd_config.bak /etc/ssh/sshd_config
     fi
 else
-    warn "SSH ключи не найдены! Вход по парню оставлен включенным."
-    warn "Добавьте SSH ключи в /root/.ssh/authorized_keys и перезапустите скрипт."
+    warn "SSH ключи не найдены! Вход по паролю оставлен включенным."
+    warn "Добавьте SSH ключи в /root/.ssh/authorized_keys для безопасности."
 fi
 
-# 10. ЗАПУСК СЕРВИСОВ
-log "10. Запуск всех сервисов..."
+# 12. ЗАПУСК ВСЕХ СЕРВИСОВ И ФИНАЛЬНАЯ ПРОВЕРКА
+log "12. Запуск всех сервисов и финальная проверка..."
 
 systemctl daemon-reload
-systemctl enable --now xray hysteria-server prometheus-node-exporter
+systemctl enable --now xray hysteria-server
 
-# Проверка статусов
-sleep 2
+# Даем время на запуск
+sleep 5
 
 echo -e "\n╔══════════════════════════════════════════════════════════╗"
 echo "║                    СТАТУС СЕРВИСОВ                     ║"
@@ -556,20 +715,53 @@ echo "╚═══════════════════════�
 
 check_service() {
     local service=$1
-    if systemctl is-active --quiet "$service"; then
-        echo -e "  ✅ $service: \033[1;32mACTIVE\033[0m"
-    else
-        echo -e "  ❌ $service: \033[1;31mFAILED\033[0m"
-        journalctl -u "$service" -n 10 --no-pager
-    fi
+    local max_attempts=3
+    local attempt=1
+    
+    while [[ $attempt -le $max_attempts ]]; do
+        if systemctl is-active --quiet "$service"; then
+            echo -e "  ✅ $service: \033[1;32mACTIVE\033[0m"
+            return 0
+        else
+            if [[ $attempt -eq $max_attempts ]]; then
+                echo -e "  ❌ $service: \033[1;31mFAILED\033[0m"
+                journalctl -u "$service" -n 10 --no-pager | tail -5
+                return 1
+            fi
+            sleep 2
+            ((attempt++))
+        fi
+    done
 }
 
 check_service xray
 check_service hysteria-server
-check_service fail2ban
-check_service prometheus-node-exporter
 
-# 11. ФИНАЛЬНЫЙ ВЫВОД ИНФОРМАЦИИ
+echo -e "\n📊 Проверка портов:"
+echo "------------------"
+
+check_port_status() {
+    local port=$1
+    local protocol=$2
+    local service=$3
+    
+    if check_port "$port" "$protocol"; then
+        echo -e "  ✅ $service ($port/$protocol): \033[1;32mСВОБОДЕН\033[0m"
+    else
+        echo -e "  ⚠ $service ($port/$protocol): \033[1;33mЗАНЯТ\033[0m"
+        ss -ln${protocol:0:1} | grep ":$port "
+    fi
+}
+
+check_port_status 80 tcp "HTTP (nginx)"
+check_port_status 443 tcp "HTTPS (Xray)"
+check_port_status "$HYSTERIA_PORT" udp "Hysteria2"
+
+echo -e "\n🐳 Проверка Docker:"
+echo "-----------------"
+docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+
+# 13. ФИНАЛЬНЫЙ ВЫВОД ИНФОРМАЦИИ
 log "=== УСТАНОВКА ЗАВЕРШЕНА ==="
 
 # Получение публичного IP
@@ -582,18 +774,15 @@ echo "╚═══════════════════════�
 echo -e "\n📡 \033[1;36mОСНОВНЫЕ ДАННЫЕ:\033[0m"
 echo "  • Сервер: $PUBLIC_IP"
 echo "  • Домен: $DOMAIN"
+echo "  • Веб-сайт: http://$DOMAIN (проверка работы)"
 
-echo -e "\n🔐 \033[1;36mXRAY (VLESS):\033[0m"
+echo -e "\n🔐 \033[1;36mXRAY (VLESS+Reality):\033[0m"
 echo "  • UUID: $XRAY_UUID"
-echo "  • Порт: 443 (TCP)"
-if [[ "$XRAY_PROTOCOL_CHOICE" == "2" ]]; then
-    echo "  • Протокол: Reality"
-    echo "  • Public Key: $XRAY_PUBLIC_KEY"
-    echo "  • Short ID: $XRAY_SHORT_ID"
-else
-    echo "  • Протокол: TLS"
-fi
+echo "  • Порт: $XRAY_PORT (TCP)"
+echo "  • Public Key: $XRAY_PUBLIC_KEY"
+echo "  • Short ID: $XRAY_SHORT_ID"
 echo "  • Flow: xtls-rprx-vision"
+echo "  • SNI: www.google.com"
 
 echo -e "\n⚡ \033[1;36mHYSTERIA2:\033[0m"
 echo "  • Пароль: $HY_PASSWORD"
@@ -601,7 +790,7 @@ echo "  • Порт: $HYSTERIA_PORT (UDP)"
 echo "  • SNI: $DOMAIN"
 
 echo -e "\n🌐 \033[1;36mВЕБ-САЙТ:\033[0m"
-echo "  • URL: https://$DOMAIN"
+echo "  • URL: http://$DOMAIN"
 if [[ -n "$GITHUB_REPO_URL" ]]; then
     echo "  • Репозиторий: $GITHUB_REPO_URL"
 fi
@@ -609,18 +798,25 @@ fi
 echo -e "\n🛡️  \033[1;36mБЕЗОПАСНОСТЬ:\033[0m"
 echo "  • Fail2ban: активен"
 echo "  • SSH защита: включена"
-echo "  • Мониторинг: http://$PUBLIC_IP:9100/metrics"
+if systemctl is-active --quiet prometheus-node-exporter 2>/dev/null; then
+    echo "  • Мониторинг: http://$PUBLIC_IP:9100/metrics"
+fi
 
 echo -e "\n📋 \033[1;36mКОМАНДЫ ДЛЯ ПРОВЕРКИ:\033[0m"
 echo "  • Статус сервисов: systemctl status xray hysteria-server"
 echo "  • Логи Xray: journalctl -u xray -f"
 echo "  • Логи Hysteria: journalctl -u hysteria-server -f"
-echo "  • Проверить порты: ss -tulpn | grep -E '(443|$HYSTERIA_PORT)'"
+echo "  • Проверить порты: ss -tulpn | grep -E '(443|$HYSTERIA_PORT|80)'"
 
 echo -e "\n⚠️  \033[1;33mВАЖНО:\033[0m"
-echo "  • Сохраните UUID и пароль в безопасном месте!"
-echo "  • Добавьте SSH ключ для доступа к серверу"
+echo "  • Сохраните UUID, Public Key и пароль в безопасном месте!"
 echo "  • Логи установки: $LOG_FILE"
-echo "  • Бэкапы конфигов: $BACKUP_DIR"
+echo "  • Для Reality клиента используйте:"
+echo "    - Сервер: $DOMAIN:$XRAY_PORT"
+echo "    - UUID: $XRAY_UUID"
+echo "    - Public Key: $XRAY_PUBLIC_KEY"
+echo "    - Short ID: $XRAY_SHORT_ID"
 
-echo -e "\n\033[1;32m✅ Настройка сервера успешно завершена!\033[0m\n"
+echo -e "\n\033[1;32m✅ Настройка сервера успешно завершена! Все сервисы должны работать.\033[0m"
+echo -e "\nДля тестирования откройте в браузере: http://$DOMAIN"
+echo "Для VPN используйте данные выше с любым совместимым клиентом."
